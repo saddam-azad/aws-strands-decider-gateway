@@ -1,0 +1,10 @@
+node_modules
+dist
+cdk.out
+.env
+loadtest/config.json
+loadtest/results/
+client/config.json
+*.log
+__pycache__/
+.pytest_cache/

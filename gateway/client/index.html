@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Strands Decider</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<header>
+  <h1>Strands&nbsp;Decider</h1>
+  <p class="sub">System-one decisions, online. Ask a question, get probabilities — and a verdict on whether to trust them.</p>
+</header>
+
+<main>
+  <section class="panel">
+    <label class="field">
+      <span>API key</span>
+      <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="pk_…" />
+    </label>
+    <p class="hint">Stored in this tab only, sent as <code>x-api-key</code>.</p>
+
+    <label class="field">
+      <span>Scenario</span>
+      <select id="scenario"></select>
+    </label>
+    <p class="hint" id="scenarioHint"></p>
+
+    <div id="inputs"></div>
+
+    <div class="row">
+      <label class="check"><input id="gate" type="checkbox" checked /> gate the answer</label>
+      <label class="check"><input id="cache" type="checkbox" checked /> allow caching</label>
+    </div>
+
+    <button id="run" type="button">Decide</button>
+    <p class="hint" id="status"></p>
+  </section>
+
+  <section class="panel wide">
+    <div id="answer" class="answer idle">
+      <p class="placeholder">The decision will appear here.</p>
+    </div>
+    <dl id="stats" class="stats" hidden></dl>
+    <details id="rawWrap" hidden>
+      <summary>Raw response</summary>
+      <pre id="raw"></pre>
+    </details>
+  </section>
+</main>
+
+<footer>
+  <span id="rid"></span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,40 @@
+{
+  "tenants": {
+    "acme": {
+      "default_model": "decider-2b",
+      "allowed_models": ["decider-2b"],
+      "requests_per_hour": 1000,
+      "cache_ttl_seconds": 300,
+      "max_state_chars": 20000,
+      "redact": ["email", "card", "phone", "\\b\\d{3}-\\d{2}-\\d{4}\\b"],
+      "apps": {
+        "support": { "requests_per_hour": 1000 },
+        "risk": {
+          "requests_per_hour": 200,
+          "redact": ["card", "\\b[A-Z]{2}\\d{2}[A-Z0-9]{11,30}\\b", "\\b\\d{3}-\\d{2}-\\d{4}\\b"]
+        }
+      }
+    },
+    "globex": {
+      "default_model": "decider-2b",
+      "allowed_models": ["decider-2b"],
+      "requests_per_hour": 200,
+      "cache_ttl_seconds": 60,
+      "redact": []
+    },
+    "trial": {
+      "default_model": "decider-2b",
+      "allowed_models": ["decider-2b"],
+      "requests_per_hour": 20,
+      "cache_ttl_seconds": 0,
+      "max_state_chars": 4000,
+      "disabled": false
+    }
+  },
+  "keys": [
+    { "tenant": "acme", "app": "support", "label": "acme support console" },
+    { "tenant": "acme", "app": "risk", "label": "acme risk review" },
+    { "tenant": "globex", "app": "support", "label": "globex bot" },
+    { "tenant": "trial", "app": "support", "label": "self-serve trial" }
+  ]
+}

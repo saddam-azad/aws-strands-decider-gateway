@@ -1,0 +1,9 @@
+{
+  "app": "node bin/app.ts",
+  "context": {
+    "modelMemoryMb": 10240,
+    "modelReservedConcurrency": 4,
+    "deciderGitRef": "main",
+    "appVersion": "unset"
+  }
+}

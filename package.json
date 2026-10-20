@@ -1,0 +1,43 @@
+{
+  "name": "aws-strands-decider-gateway",
+  "version": "0.1.0",
+  "description": "Strands Decider (system one model) hosted on AWS Lambda, behind a TypeScript gateway with multi-tenancy, confidence gating and a Firehose -> S3 -> Glue -> Athena evidence stack.",
+  "keywords": ["strands-decider", "system-one", "aws-lambda", "cdk", "decision-model", "typescript"],
+  "license": "Apache-2.0",
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --test-reporter=spec \"tests/unit/*.test.ts\"",
+    "synth": "cdk synth",
+    "deploy": "cdk deploy",
+    "destroy": "cdk destroy",
+    "diff": "cdk diff",
+    "setup": "node scripts/setup.ts",
+    "e2e": "node tests/e2e.ts",
+    "model:build": "bash scripts/build-model-image.sh",
+    "model:local": "bash scripts/run-model-local.sh",
+    "dev": "bash scripts/dev.sh",
+    "loadtest": "cd loadtest && ./run.sh",
+    "verify": "bun run typecheck && bun run test && bun run synth"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@aws-sdk/client-cloudformation": "^3.1152.0",
+    "@aws-sdk/client-dynamodb": "^3.1152.0",
+    "@aws-sdk/client-firehose": "^3.1152.0",
+    "@aws-sdk/client-s3": "^3.1153.0",
+    "@aws-sdk/client-ssm": "^3.1152.0",
+    "@aws-sdk/lib-dynamodb": "^3.1152.0",
+    "@types/aws-lambda": "^8.10.164",
+    "@types/node": "^26.6.5",
+    "aws-cdk": "^2.1145.0",
+    "aws-cdk-lib": "^2.273.0",
+    "aws4fetch": "^1.0.20",
+    "constructs": "^10.8.1",
+    "typescript": "^7.0.2"
+  }
+}
