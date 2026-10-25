@@ -56,17 +56,11 @@ export const DEFAULTS = {
 } as const;
 
 export interface GatewayConfig {
-  /** The decider's Function URL. */
+  /** The decider's internal ALB URL. */
   readonly deciderUrl: string;
   readonly deciderPath?: string;
   readonly timeoutMs?: number;
   readonly retries?: number;
-  /**
-   * How to authenticate to the decider: SigV4 (`iam`, the deployed default) or nothing
-   * (`none`, for a local fake). Defaults to `iam` so a misconfigured deployment fails to
-   * sign rather than silently sending unauthenticated requests.
-   */
-  readonly deciderAuth?: "iam" | "none";
   /** Defaults applied when a tenant sets none. Env-tunable so both stacks stay in step. */
   readonly defaults?: Partial<typeof DEFAULTS>;
   /** L0 cache. */
@@ -141,7 +135,6 @@ export function createHandler(deps: HandlerDeps) {
   const makeDecider = deps.createDecider ?? ((c: GatewayConfig) => decider({
     baseUrl: c.deciderUrl,
     ...(c.deciderPath === undefined ? {} : { path: c.deciderPath }),
-    auth: c.deciderAuth ?? "iam",
     timeoutMs: c.timeoutMs ?? defaults.timeoutMs,
     retries: c.retries ?? defaults.retries,
     ...(c.fetch === undefined ? {} : { fetch: c.fetch }),

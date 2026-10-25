@@ -2,26 +2,27 @@
 
 [Strands Decider](https://github.com/strands-labs/strands-decider) — a system-one classifier
 that gives calibrated answers to `noul` (yes/no), `choice` and `score` questions — hosted on
-AWS Lambda, behind a TypeScript gateway with multi-tenancy, confidence gating, and an evidence
+Fargate, behind a TypeScript gateway with multi-tenancy, confidence gating, and an evidence
 trail that reaches Athena.
 
-Two functions. The gateway is a Node function you can read in one sitting. The model is a
-10 GB container that holds a 4.8 GB checkpoint. Between them: a SigV4-signed HTTP call, and a
-Firehose → S3 → Glue → Athena pipeline that records every request that went through.
+Two services. The gateway runs on ECS Express Gateway (public, scale-to-zero). The model runs
+on Fargate behind an internal ALB (private subnet, reachable only from within the VPC). Between
+them: a plain HTTP call over the VPC, and a Firehose → S3 → Glue → Athena pipeline that
+records every request that went through.
 
 ```
                  ┌──────────────────────────┐
-  browser ──┐    │  gateway (Node 26, arm64) │        SigV4        ┌────────────────────────┐
-  curl ─────┼───▶│  Function URL, AuthType   │───────────────────▶│ model Lambda (x86_64)  │
-  client ───┘    │  NONE, x-api-key          │                    │ 10 GB, container image │
-                 │  API keys → DynamoDB      │                    │ CPU-only torch + 2B    │
-                 │  cache, quota, redaction  │                    │ cold start 25-60 s     │
-                 └────────────┬──────────────┘                    └───────────┬────────────┘
-                              │ EMF metrics                                   │ EMF metrics
-                              ▼                                               ▼
-                     CloudWatch dashboard + alarms        Firehose ─▶ S3 (day partitions)
-                                                                          │
-                                              Athena workgroup ◀── Glue tables (projection)
+  browser ──┐    │  gateway (Node 26, arm64) │      plain HTTP      ┌────────────────────────┐
+  curl ─────┼───▶│  ECS Express Gateway      │────────────────────▶│ model (Fargate, x86_64)│
+  client ───┘    │  x-api-key auth           │    internal ALB      │ 10 GB, FastAPI/uvicorn │
+                 │  API keys → DynamoDB      │    private subnet    │ CPU-only torch + 2B    │
+                 │  cache, quota, redaction  │                      │ cold start 25-60 s     │
+                 └────────────┬──────────────┘                      └───────────┬────────────┘
+                              │ EMF metrics                                     │ EMF metrics
+                              ▼                                                 ▼
+                     CloudWatch dashboard + alarms          Firehose ─▶ S3 (day partitions)
+                                                                            │
+                                                Athena workgroup ◀── Glue tables (projection)
 ```
 
 ## Quick start
@@ -52,7 +53,7 @@ bun run e2e                     # exercises the deployed stack end to end
 
 ## Why there is no build step
 
-`gateway/` is uploaded to Lambda **verbatim**. There is no bundler, no transpile, no `dist/`.
+`gateway/` is deployed to ECS **verbatim**. There is no bundler, no transpile, no `dist/`.
 The asset is the source, and `gateway/entry.mjs` is 4 lines.
 
 This works because Node 26 strips TypeScript types natively, and three things are kept true so
@@ -66,10 +67,9 @@ it keeps working:
 3. **`entry.mjs` stays a single dynamic import.** The one place a transform could sneak in is
    the entry point itself, so it does one thing: `await import("./bootstrap.ts")`.
 
-The payoff is that a deployed function's stack trace points at `gateway/handler.ts:359`, the
+The payoff is that a deployed container's stack trace points at `gateway/handler.ts:359`, the
 file you edited, with no source maps between you and it. The cost is that the gateway's
-dependencies must already exist in the Lambda Node 26 runtime. They do: the entire bare
-specifier set is
+dependencies must already exist in the Node 26 runtime. They do: the entire bare specifier set is
 
 ```
 node:crypto  node:fs  node:path  node:timers/promises  node:url
@@ -77,48 +77,41 @@ aws-lambda
 @aws-sdk/client-dynamodb  @aws-sdk/client-firehose  @aws-sdk/lib-dynamodb
 ```
 
-The AWS SDK v3 and `aws-lambda` types are node builtins in the Lambda runtime; `node:*` is
-node. Nothing is installed at deploy time.
+`aws4fetch` is vendored into `gateway/vendor/` — it is no longer used for signing the model
+call (the model is internal), but it remains available for any future IAM-authenticated
+upstream. See [`gateway/vendor/README.md`](gateway/vendor/README.md).
 
-The one library that is *not* in the runtime is `aws4fetch`, used to SigV4-sign the call to
-the model. It is vendored, unmodified, into `gateway/vendor/` — see
-[`gateway/vendor/README.md`](gateway/vendor/README.md) for its version, license and the exact
-bytes. `aws4fetch` also stays a devDependency, so the test suite can sign the same request
-with the published library and assert the two signatures are byte-identical
-(`tests/unit/backends.test.ts`). If the vendored copy ever drifts from upstream, that test
-fails.
-
-## The model on Lambda
+## The model on Fargate
 
 `model/Dockerfile` builds one image containing a CPU-only torch, `transformers`, the
-strands-decider package from git, and the checkpoint itself.
+strands-decider package from git, and the checkpoint itself. It runs as a FastAPI/uvicorn
+HTTP server on port 8080, behind an internal ALB in a private subnet.
 
 | | |
 |---|---|
-| memory | 10240 MB |
+| memory | 10240 MiB (Fargate task) |
+| CPU | 4 vCPU (minimum that supports 10240 MiB in Fargate) |
 | architecture | x86_64 |
-| timeout | 120 s |
-| reserved concurrency | 4 |
-| image size | ~6.7 GB (Lambda's limit is 10 GB) |
+| image size | ~6.7 GB |
 | cold start | 25–60 s (weights), warm request 3–5 s |
-| cost | ~$0.0007 per uncached request |
+| min tasks | 1 (always warm) |
+| max tasks | 4 (bounds the cold-start blast radius) |
 
 Some things that are load-bearing and non-obvious:
 
-- **Only one checkpoint is Lambda-feasible.** `strands-decider-2B-qwen3.5-v1-2610` is 4.8 GB:
-  the ungated, Apache-2.0 `Qwen/Qwen3.5-2B-Base` torso plus a 235 MB adapter. Larger releases
-  are SageMaker-only, which is what upstream supports; this project is the Lambda story for
-  the one that fits.
+- **Only one checkpoint fits.** `strands-decider-2B-qwen3.5-v1-2610` is 4.8 GB: the ungated,
+  Apache-2.0 `Qwen/Qwen3.5-2B-Base` torso plus a 235 MB adapter. Larger releases are
+  SageMaker-only.
 - **CPU upcasts the torso to fp32.** The CPU path is not the fp16 path with a different
-  device; it is ~9 GB of resident memory for a 2B model. That is why memory is 10240 and not,
-  say, 3008.
+  device; it is ~9 GB of resident memory for a 2B model. That is why memory is 10240 MiB.
 - **Weights are baked, not downloaded.** `HF_HOME=/opt/hf` puts the Hub cache inside the
-  image, and `HF_HUB_OFFLINE=1` makes the promise enforceable: if the load path reaches for
-  the network, it fails at build time rather than at 3 AM.
-- **Reserved concurrency 4 bounds the cold-start blast radius.** Every instance that starts
-  from zero costs a full weight load. Four is the number that keeps a traffic spike from
-  silently multiplying that cost by fifty, and the gateway's retry ladder is sized to sit
-  within it.
+  image, and `HF_HUB_OFFLINE=1` makes that promise enforceable.
+- **The model loads at startup, not on first request.** The FastAPI `lifespan` hook calls
+  `engine()` before the container is marked healthy, so the ALB never routes a request to a
+  cold task.
+- **The internal ALB is the only ingress.** The model's security group only accepts traffic
+  from the ALB's security group on port 8080. There is no public IP and no IAM auth needed
+  on this hop.
 
 The decider's `ScoreQuestion.criteria` is `list[str]` and `NoulQuestion.criteria` is an
 optional `{"true","false"}` map. The gateway's validator enforces exactly that, so a malformed
@@ -139,7 +132,7 @@ upstream body or a stack trace.
 | 5 | Redact | **before** hashing for the cache and before the wire |
 | 6 | Cache | L0 in-process, then L1 DynamoDB |
 | 7 | Quota | atomic `ADD` against the tenant's hourly bucket |
-| 8 | Model | SigV4 to the decider, with a retry ladder |
+| 8 | Model | plain HTTP to the internal ALB, with a retry ladder |
 | 9 | Gate + format | local confidence metrics, act/review/escalate |
 | 10 | Evidence | EMF metrics, a usage record, a structured log line |
 
@@ -196,7 +189,7 @@ bun run dev          # fake model on :8080, real gateway on :3000
 ```
 
 `scripts/dev.sh` starts `model/devserver.py --fake` and then `scripts/dev-server.ts`, which
-runs **the same handler the Lambda runs**, wrapped in a `node:http` server that translates a
+runs **the same handler the ECS task runs**, wrapped in a `node:http` server that translates a
 request into an API Gateway v2 event. The translation is deliberate: a second, simplified
 request path for development is how "works locally, 502s in the cloud" happens.
 
@@ -215,15 +208,15 @@ Everything else is real: auth, validation, redaction, the cache, the quota arith
 confidence math, the telemetry. The dev server seeds every tenant from `config/tenants.json`
 with its real quota, so `429` is reachable locally.
 
-To run the actual model:
+To run the actual model locally:
 
 ```bash
 bun run model:local                          # downloads 4.8 GB, loads in 25-60 s
 DECIDER_URL=http://127.0.0.1:8080 bun run scripts/dev-server.ts
 ```
 
-`bun run dev` accepts the model first — it polls `/health` rather than sleeping a guessed
-amount, so the gateway's first request is never a race.
+`bun run dev` polls `/healthz` rather than sleeping a guessed amount, so the gateway's first
+request is never a race.
 
 ## The evidence stack
 
@@ -259,7 +252,7 @@ cdk deploy -c alarmEmail=ops@example.com
 
 ```bash
 bun run loadtest baseline      # 10 users, one request each
-bun run loadtest load          # ramp past the model's concurrency ceiling
+bun run loadtest load          # ramp past the model's task ceiling
 bun run loadtest burst         # everything at once
 bun run loadtest coldstart     # every request a cache miss
 bun run loadtest quota         # exceed a tenant's hourly limit
@@ -269,18 +262,18 @@ bun run loadtest mixed         # all question shapes, all tenants
 Needs [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) and the config from
 `bun run setup`; `loadtest/run.sh` prints install instructions if k6 is missing.
 
-Sizing note: with `reservedConcurrentExecutions: 4` on the model, `load` is *expected* to bend
-sharply past four concurrent callers — beyond that, requests queue for a free instance, and
-those that wait longer than the gateway's 45 s per-attempt deadline become retries. That bend
-is the finding, not a failure. Ship to more instances (a second deployment, or Fargate) if you
-need the flat part to extend further right.
+Sizing note: with `maxTaskCount: 4` on the model, `load` is *expected* to bend sharply past
+four concurrent callers — beyond that, requests queue for a free task, and those that wait
+longer than the gateway's 45 s per-attempt deadline become retries. That bend is the finding,
+not a failure. Raise `modelMaxTasks` in `cdk.json` if you need the flat part to extend further
+right.
 
 ## Layout
 
 ```
-gateway/            the Lambda asset, shipped verbatim
+gateway/            the ECS Express Gateway asset, shipped verbatim
   handler.ts        the ten gates
-  backends.ts       SigV4 + the decider client, retry ladder
+  backends.ts       the decider HTTP client, retry ladder
   policy.ts         tenants, keys, quota, routing
   confidence.ts     top / margin / certainty, bands
   redact.ts         email, card, phone, iban, ssn
@@ -288,12 +281,12 @@ gateway/            the Lambda asset, shipped verbatim
   cache.ts          L0 in-process cache
   telemetry.ts      EMF metrics, usage records, structured logs
   client/           the web client (static, no build)
-  vendor/           aws4fetch, unmodified
+  vendor/           aws4fetch, vendored
   devfake.ts        in-memory DynamoDB, for `bun run dev` only
-model/              the container Lambda
-  Dockerfile        CPU torch + the 4.8 GB checkpoint, baked in
-  handler.py        lazy load, cold-start attribution
-  devserver.py      the same contract over http.server
+model/              the Fargate model service
+  Dockerfile        CPU torch + the 4.8 GB checkpoint, baked in; FastAPI/uvicorn server
+  handler.py        FastAPI app, model load at startup, inference endpoint
+  devserver.py      the same HTTP contract over http.server
   tests/            pytest, no torch required
 lib/stack.ts        the CDK stack
 bin/app.ts          the CDK app
@@ -308,20 +301,20 @@ tests/e2e.ts        against a deployed stack
 
 ```bash
 bun run typecheck     # tsc --noEmit, strict
-bun run test          # 118 tests, no AWS, no torch, ~3 s
+bun run test          # node --test, no AWS, no torch, ~3 s
 bun run verify        # typecheck + test + synth
-cd model && python -m pytest tests/   # 11 tests, no torch
+cd model && python -m pytest tests/   # no torch required
 ```
 
 The unit suite covers the ten gates, the retry ladder, the confidence math, the validator, the
-Telemetry shape, the in-memory table, and the stack's contract. The stack tests assert the
+telemetry shape, the in-memory table, and the stack's contract. The stack tests assert the
 decisions that are expensive to get wrong — the runtime, the memory, the IAM boundary, the
 partition projection, the alarm names — rather than a snapshot, which would break on every
 unrelated CDK upgrade and tell you nothing.
 
 The model's pytest suite replaces `strands_decider` in `sys.modules` with a stub, so what it
-asserts is this function's HTTP contract — status codes, error shapes, cold-start attribution
-— not the model's own correctness, which belongs to the upstream project.
+asserts is the HTTP contract — status codes, error shapes, cold-start attribution — not the
+model's own correctness, which belongs to the upstream project.
 
 ## Configuration
 
@@ -329,27 +322,25 @@ asserts is this function's HTTP contract — status codes, error shapes, cold-st
 
 | key | default | what |
 |---|---|---|
-| `modelMemoryMb` | 10240 | model function memory. 2B at fp32 needs ~9 GB. |
-| `modelReservedConcurrency` | 4 | bounds the cold-start blast radius. |
+| `modelMemoryMb` | 10240 | model Fargate task memory in MiB. 2B at fp32 needs ~9 GB. |
+| `modelMaxTasks` | 4 | maximum model tasks. Bounds the cold-start blast radius. |
 | `deciderGitRef` | `main` | the strands-decider commit baked into the image. Pin a SHA for a reproducible build. |
 | `appVersion` | `unset` | reported by `/healthz`, so a smoke test can tell which build it reached. |
 | `alarmEmail` | *(none)* | SNS topic for the three alarms. |
 
 ## Cost
 
-The model dominates. At `reservedConcurrency: 4` and a warm request of 3–5 s, a 10 GB function
-costs ~$0.0007 per request in GB-seconds, plus the cold starts. With no traffic the reserved
-concurrency keeps nothing warm by itself, but every scaling event pays 25–60 s of 10 GB
-billing, so a workload that idles and bursts is the expensive shape. Steady traffic that stays
-inside four instances is the cheap one.
+The model dominates. At `maxTaskCount: 4` and a warm request of 3–5 s, a 4 vCPU / 10 GB
+Fargate task costs roughly $0.0009 per request in vCPU+memory seconds, plus the cold starts.
+Unlike Lambda, Fargate tasks with `minCapacity: 1` keep one task warm at all times — you pay
+for idle time but avoid cold starts on the first request of the day.
 
-The rest — the gateway at 512 MB, DynamoDB on-demand, Firehose, S3 with a 30-day lifecycle,
-Athena at a 1 GB cap — is noise beside it.
+The rest — the gateway on ECS Express Gateway, DynamoDB on-demand, Firehose, S3 with a 30-day
+lifecycle, Athena at a 1 GB cap — is noise beside it.
 
 `cdk destroy` removes everything except the two S3 buckets' contents if you keep them; the
 buckets themselves are set to destroy with the stack.
 
 ## License
 
-Apache-2.0, matching the upstream model. `gateway/vendor/aws4fetch.*` is MIT, © Michael Hart;
-its license ships beside it.
+Apache-2.0

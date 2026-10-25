@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { AwsClient as Published } from "aws4fetch";
-import { decider, signingFetch } from "../../gateway/backends.ts";
+import { decider } from "../../gateway/backends.ts";
 import { AwsClient as Vendored } from "../../gateway/vendor/aws4fetch.mjs";
 import { DecideError } from "../../gateway/errors.ts";
 
@@ -13,8 +12,7 @@ const ok = (body: unknown, headers: Record<string, string> = {}) =>
 test("posts the model's own protocol and parses the answer", async () => {
   let seen: { url: string; body: unknown; headers: Record<string, string> } | undefined;
   const backend = decider({
-    baseUrl: "https://example.lambda-url.us-east-1.on.aws/",
-    auth: "none",
+    baseUrl: "https://internal-alb.us-east-1.elb.amazonaws.com/",
     fetch: (async (url: string, init: RequestInit) => {
       seen = { url: String(url), body: JSON.parse(String(init.body)), headers: init.headers as Record<string, string> };
       return ok({
@@ -27,7 +25,7 @@ test("posts the model's own protocol and parses the answer", async () => {
   });
 
   const res = await backend.evaluate({ state: "hello", questions: QUESTIONS, model: "decider-2b" });
-  assert.equal(seen?.url, "https://example.lambda-url.us-east-1.on.aws/v1/systemone", "no doubled slash");
+  assert.equal(seen?.url, "https://internal-alb.us-east-1.elb.amazonaws.com/v1/systemone", "no doubled slash");
   assert.deepEqual(seen?.body, { state: "hello", questions: QUESTIONS, model: "decider-2b" });
   assert.equal(seen?.headers["content-type"], "application/json");
   assert.equal(res.answers.q, 0.82);
@@ -40,7 +38,6 @@ test("preserves a base path in the URL", async () => {
   let url = "";
   const backend = decider({
     baseUrl: "https://example.com/api",
-    auth: "none",
     fetch: (async (u: string) => {
       url = String(u);
       return ok({ answers: { q: 0.5 } });
@@ -53,7 +50,6 @@ test("preserves a base path in the URL", async () => {
 test("reads cold-start attribution off the response headers", async () => {
   const cold = decider({
     baseUrl: "https://x",
-    auth: "none",
     fetch: (async () =>
       ok({ answers: { q: 0.5 } }, { "x-decider-cold-start": "true", "x-decider-model-load-ms": "21400" })) as typeof globalThis.fetch,
   });
@@ -65,7 +61,6 @@ test("reads cold-start attribution off the response headers", async () => {
 test("omits cold-start fields when the model did not report them", async () => {
   const warm = decider({
     baseUrl: "https://x",
-    auth: "none",
     fetch: (async () => ok({ answers: { q: 0.5 } })) as typeof globalThis.fetch,
   });
   const res = await warm.evaluate({ state: "s", questions: QUESTIONS, model: "m" });
@@ -77,7 +72,6 @@ test("retries a 503 and then succeeds", async () => {
   let calls = 0;
   const backend = decider({
     baseUrl: "https://x",
-    auth: "none",
     retries: 2,
     fetch: (async () => {
       calls += 1;
@@ -92,7 +86,6 @@ test("does not retry a 400", async () => {
   let calls = 0;
   const backend = decider({
     baseUrl: "https://x",
-    auth: "none",
     retries: 3,
     fetch: (async () => {
       calls += 1;
@@ -117,7 +110,6 @@ test("maps status codes onto error codes", async () => {
   for (const [status, code] of cases) {
     const backend = decider({
       baseUrl: "https://x",
-      auth: "none",
       retries: 0,
       fetch: (async () => new Response("nope", { status })) as typeof globalThis.fetch,
     });
@@ -132,7 +124,6 @@ test("maps status codes onto error codes", async () => {
 test("never puts the upstream body in the message for a 5xx", async () => {
   const backend = decider({
     baseUrl: "https://x",
-    auth: "none",
     retries: 0,
     fetch: (async () => new Response('{"secret":"token-abc123"}', { status: 500 })) as typeof globalThis.fetch,
   });
@@ -149,7 +140,6 @@ test("never puts the upstream body in the message for a 5xx", async () => {
 test("reports a non-JSON body as a malformed response", async () => {
   const backend = decider({
     baseUrl: "https://x",
-    auth: "none",
     fetch: (async () => new Response("<html>gateway timeout</html>", { status: 200 })) as typeof globalThis.fetch,
   });
   await assert.rejects(
@@ -161,7 +151,6 @@ test("reports a non-JSON body as a malformed response", async () => {
 test("reports a JSON body with no answers as a malformed response", async () => {
   const backend = decider({
     baseUrl: "https://x",
-    auth: "none",
     fetch: (async () => ok({ model: "m" })) as typeof globalThis.fetch,
   });
   await assert.rejects(
@@ -173,7 +162,6 @@ test("reports a JSON body with no answers as a malformed response", async () => 
 test("treats a timeout as retryable, then reports a timeout error", async () => {
   const backend = decider({
     baseUrl: "https://x",
-    auth: "none",
     retries: 1,
     timeoutMs: 20,
     fetch: (async (_url: string, init: RequestInit) => {
@@ -197,7 +185,6 @@ test("aborts the attempt when the caller's signal fires", async () => {
   const controller = new AbortController();
   const backend = decider({
     baseUrl: "https://x",
-    auth: "none",
     retries: 2,
     timeoutMs: 60_000,
     fetch: (async (_url: string, init: RequestInit) =>
@@ -210,61 +197,18 @@ test("aborts the attempt when the caller's signal fires", async () => {
   await assert.rejects(promise, /caller went away/);
 });
 
-/* ---------------------------------------------------------------------- SigV4 */
+/* ---------------------------------------------------------------------- vendored aws4fetch */
 
-test("signingFetch refuses to sign without credentials", async () => {
-  // `signingFetch` is lazy: it returns a fetch that resolves credentials per call, so a
-  // missing role shows up as a failed request, not as a failed construction.
-  const saved = { ...process.env };
-  delete process.env["AWS_ACCESS_KEY_ID"];
-  delete process.env["AWS_SECRET_ACCESS_KEY"];
-  delete process.env["AWS_SESSION_TOKEN"];
-  const savedFetch = globalThis.fetch;
-  try {
-    const signedFetch = signingFetch();
-    assert.throws(
-      () => signedFetch.call(globalThis, "https://x.example/v1/systemone", { method: "POST", body: "{}" }),
-      (e: unknown) => e instanceof DecideError && e.code === "auth",
-    );
-  } finally {
-    Object.assign(process.env, saved);
-    globalThis.fetch = savedFetch;
-  }
-});
-
-test("the vendored aws4fetch signs byte-identically to the published package", async () => {
-  // This is the whole justification for vendoring: if these ever diverge, the Lambda's
-  // signature stops matching and every request 403s, so it is worth a test.
-  const credentials = {
+test("the vendored aws4fetch still signs correctly", async () => {
+  const client = new Vendored({
     accessKeyId: "AKIAIOSFODNN7EXAMPLE",
     secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
     sessionToken: "session-token",
     region: "us-east-1",
-    service: "lambda",
-    retries: 0,
-  };
-  const url = "https://abc123.lambda-url.us-east-1.on.aws/v1/systemone";
-  const init = { method: "POST", headers: { "content-type": "application/json" }, body: '{"state":"s"}' };
-
-  const a = await new Vendored(credentials).sign(url, init);
-  const b = await new Published(credentials).sign(url, init);
-
-  const auth = (req: Request | undefined) => req?.headers.get("authorization");
-  assert.ok(auth(a)?.startsWith("AWS4-HMAC-SHA256"), "signed with the v4 algorithm");
-  assert.equal(auth(a), auth(b));
-  assert.equal(a?.headers.get("x-amz-security-token"), b?.headers.get("x-amz-security-token"));
-  assert.equal(a?.headers.get("x-amz-date"), b?.headers.get("x-amz-date"));
-});
-
-test("the vendored signer carries the session token", async () => {
-  const client = new Vendored({
-    accessKeyId: "AKIAIOSFODNN7EXAMPLE",
-    secretAccessKey: "secret",
-    sessionToken: "the-session-token",
-    region: "us-east-1",
-    service: "lambda",
+    service: "execute-api",
     retries: 0,
   });
   const signed = await client.sign("https://x.example/v1/systemone", { method: "POST", body: "{}" });
-  assert.equal(signed.headers.get("x-amz-security-token"), "the-session-token");
+  assert.ok(signed.headers.get("authorization")?.startsWith("AWS4-HMAC-SHA256"), "signed with v4 algorithm");
+  assert.equal(signed.headers.get("x-amz-security-token"), "session-token");
 });

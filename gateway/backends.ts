@@ -1,19 +1,16 @@
 /**
- * The gateway's only HTTP hop: `POST /v1/systemone` on the decider Lambda's Function URL.
+ * The gateway's only HTTP hop: `POST /v1/systemone` on the decider Fargate service.
  *
  * Ported from lambda-decide's `backends.ts` — same retry ladder, same status→error mapping,
- * same "never leak the upstream body" discipline — with two changes:
+ * same "never leak the upstream body" discipline. The decider runs behind an internal ALB
+ * reachable only from within the VPC, so no auth header is needed on this hop.
  *
- *   1. The upstream is our own decider function, so auth is SigV4 (`AuthType: AWS_IAM`)
- *      rather than an API key. Credentials come from the execution role's environment
- *      variables, which Lambda rotates in place, so they are read per call.
- *   2. The decider is a cold-starting 10 GB container, so the per-attempt deadline is
- *      measured in tens of seconds, not the 15 s a hosted API would get.
+ * The decider is a cold-starting 10 GB container, so the per-attempt deadline is
+ * measured in tens of seconds, not the 15 s a hosted API would get.
  */
 import { setTimeout as sleep } from "node:timers/promises";
 import { DecideError } from "./errors.ts";
 import type { Questions, State, Usage } from "./types.ts";
-import { AwsClient } from "./vendor/aws4fetch.mjs";
 
 export interface DeciderRequest {
   readonly state: State;
@@ -41,12 +38,10 @@ export interface Decider {
 }
 
 export interface DeciderOptions {
-  /** The decider's Function URL, e.g. https://xxxx.lambda-url.us-east-1.on.aws/ */
+  /** The decider's internal ALB URL, e.g. http://internal-alb.us-east-1.elb.amazonaws.com */
   readonly baseUrl: string;
   /** Default "/v1/systemone". */
   readonly path?: string;
-  /** "iam" signs with SigV4; "none" sends no credentials (local dev against a fake decider). */
-  readonly auth?: "iam" | "none";
   /** Per attempt. Must outlast the model's worst-case inference, not its median. */
   readonly timeoutMs?: number;
   /** Extra attempts on 429/502/503/504/529 and network errors. Default 2. */
@@ -88,49 +83,6 @@ function retryAfterMs(res: Response): number | undefined {
 
 const backoff = (attempt: number): number => Math.min(2_000, 200 * 2 ** attempt) * (0.5 + Math.random() / 2);
 
-interface Credentials {
-  readonly accessKeyId: string;
-  readonly secretAccessKey: string;
-  readonly sessionToken?: string;
-}
-
-/**
- * The execution role's credentials, read fresh on every call.
- *
- * Lambda rotates them in place inside a warm environment, so caching the *client* across
- * invocations would eventually sign with an expired token — and `AWS_SESSION_TOKEN` is
- * required for the signature to be accepted at all.
- */
-function credentials(): Credentials {
-  const accessKeyId = process.env["AWS_ACCESS_KEY_ID"];
-  const secretAccessKey = process.env["AWS_SECRET_ACCESS_KEY"];
-  if (!accessKeyId || !secretAccessKey) {
-    throw new DecideError(
-      "auth",
-      "no AWS credentials in the environment; the gateway must run as a Lambda execution role to SigV4-sign the decider call",
-    );
-  }
-  const sessionToken = process.env["AWS_SESSION_TOKEN"];
-  return sessionToken ? { accessKeyId, secretAccessKey, sessionToken } : { accessKeyId, secretAccessKey };
-}
-
-/** A `fetch` that SigV4-signs every request for `service: "lambda"`. */
-export function signingFetch(region: string = process.env["AWS_REGION"] ?? "us-east-1"): typeof globalThis.fetch {
-  return ((input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
-    const { accessKeyId, secretAccessKey, sessionToken } = credentials();
-    // retries: 0 — our ladder owns the retry count, so retries show up in the metrics.
-    const client = new AwsClient({
-      accessKeyId,
-      secretAccessKey,
-      ...(sessionToken === undefined ? {} : { sessionToken }),
-      region,
-      service: "lambda",
-      retries: 0,
-    });
-    return client.fetch(input as string, init);
-  }) as typeof globalThis.fetch;
-}
-
 /**
  * Speaks the decider's `POST /v1/systemone` protocol: `{state, questions, model}` in,
  * `{model, answers, usage, latency_ms}` out.
@@ -139,7 +91,6 @@ export function decider(options: DeciderOptions): Decider {
   const {
     baseUrl,
     path = "/v1/systemone",
-    auth = "iam",
     timeoutMs = 60_000,
     retries = 2,
     fetch: fetchImpl,
@@ -155,9 +106,7 @@ export function decider(options: DeciderOptions): Decider {
         accept: "application/json",
       };
 
-      // A caller-supplied fetch (tests, a local fake) is used as-is; otherwise IAM auth
-      // wraps globalThis.fetch in a SigV4 signer.
-      const doFetch = fetchImpl ?? (auth === "iam" ? signingFetch() : globalThis.fetch);
+      const doFetch = fetchImpl ?? globalThis.fetch;
 
       for (let attempt = 0; ; attempt++) {
         const attemptSignal = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);

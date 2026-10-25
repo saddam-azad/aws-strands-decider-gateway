@@ -15,7 +15,7 @@ new StrandsDeciderStack(app, "StrandsDecider", {
       : { account: process.env["CDK_DEFAULT_ACCOUNT"] }),
     region: process.env["CDK_DEFAULT_REGION"] ?? "us-east-1",
   },
-  description: "Strands Decider model on Lambda, behind a TypeScript gateway with an Athena evidence trail.",
+  description: "Strands Decider model on Fargate and Athena evidence trail.",
   // Email for the three alarms. Unset means they exist and stay silent.
   ...(app.node.tryGetContext("alarmEmail") === undefined
     ? {}

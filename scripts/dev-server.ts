@@ -82,9 +82,6 @@ const handler = createHandler({
   config: {
     deciderUrl: DECIDER_URL,
     deciderPath: process.env["DECIDER_PATH"] ?? "/v1/systemone",
-    // The dev server runs against a local fake, which has no IAM to check, so no signing by
-    // default. Set `DECIDER_AUTH=iam` to exercise the SigV4 path against a real Function URL.
-    deciderAuth: process.env["DECIDER_AUTH"] === "iam" ? "iam" : "none",
     timeoutMs: Number(process.env["DECIDER_TIMEOUT_MS"] ?? 45_000),
     ...(process.env["SERVE_CLIENT"] === "false"
       ? {}

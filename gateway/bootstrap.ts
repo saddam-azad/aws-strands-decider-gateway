@@ -25,9 +25,6 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): GatewayConf
   return {
     deciderUrl,
     ...(env["DECIDER_PATH"] === undefined ? {} : { deciderPath: env["DECIDER_PATH"] }),
-    // Defaults to SigV4. `DECIDER_AUTH=none` is for a local fake decider only; it is never
-    // set by either CDK stack, so a deployed environment always signs.
-    deciderAuth: env["DECIDER_AUTH"] === "none" ? "none" : "iam",
     timeoutMs: num("DECIDER_TIMEOUT_MS", 45_000),
     retries: num("DECIDER_RETRIES", 2),
     cache: { ttlSeconds: num("CACHE_TTL_SECONDS", 300), maxEntries: num("CACHE_MAX_ENTRIES", 500) },
