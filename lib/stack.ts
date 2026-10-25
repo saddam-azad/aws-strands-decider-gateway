@@ -25,10 +25,12 @@ import {
   aws_glue as glue,
   aws_iam as iam,
   aws_kinesisfirehose as firehose,
+  aws_lambda as lambda_,
   aws_logs as logs,
   aws_s3 as s3,
   aws_sns as sns,
 } from "aws-cdk-lib";
+import { NodejsFunction, OutputFormat } from "aws-cdk-lib/aws-lambda-nodejs";
 import { Construct } from "constructs";
 import { Platform } from "aws-cdk-lib/aws-ecr-assets";
 
@@ -42,9 +44,6 @@ const MODEL_TABLE = "model_inference";
 const ATHENA_WORKGROUP = "strands-decider";
 const DASHBOARD_NAME = "strands-decider-control-tower";
 
-// aws-cdk-lib predates the Node.js 26 runtime constant, so name it directly.
-// const NODEJS_26_X = new lambda_.Runtime("nodejs26.x", lambda_.RuntimeFamily.NODEJS);
-
 export interface StrandsDeciderStackProps extends StackProps {
   /** Memory for the decider Fargate task in MiB. The 2B model needs ~9 GB resident on CPU. */
   readonly modelMemoryMb?: number;
@@ -54,12 +53,8 @@ export interface StrandsDeciderStackProps extends StackProps {
   readonly alarmEmail?: string;
   /** Model alias -> HF checkpoint, for the model function's `MODEL_MAP`. */
   readonly modelMap?: Record<string, string>;
-  /** Gateway task CPU units (256, 512, 1024, etc.) */
-  readonly gatewayCpu?: number;
-  /** Gateway task memory (MB) */
+  /** Gateway task memory (MB) — also used as Lambda memorySize */
   readonly gatewayMemoryMiB?: number;
-  /** Max tasks for Express Gateway auto-scaling (default 10) */
-  readonly gatewayMaxTasks?: number;
 }
 
 export class StrandsDeciderStack extends Stack {
@@ -191,8 +186,11 @@ export class StrandsDeciderStack extends Stack {
 
     const modelAlbSg = new ec2.SecurityGroup(this, "ModelAlbSg", { vpc: vpc as ec2.IVpc, allowAllOutbound: true });
     const modelSvcSg = new ec2.SecurityGroup(this, "ModelSvcSg", { vpc: vpc as ec2.IVpc, allowAllOutbound: true });
+    const gatewaySg = new ec2.SecurityGroup(this, "GatewaySg", { vpc: vpc as ec2.IVpc, allowAllOutbound: true });
     // Only the ALB can reach the model tasks
     modelSvcSg.addIngressRule(modelAlbSg, ec2.Port.tcp(8080));
+    // Only the gateway Lambda can reach the model ALB
+    modelAlbSg.addIngressRule(gatewaySg, ec2.Port.tcp(80));
 
     const modelAlb = new elbv2.ApplicationLoadBalancer(this, "ModelAlb", {
       vpc: vpc as ec2.IVpc,
@@ -243,84 +241,65 @@ export class StrandsDeciderStack extends Stack {
     const modelInternalUrl = `http://${modelAlb.loadBalancerDnsName}`;
     this.modelUrl = modelInternalUrl;
 
-    /* --------------------------------------------------------------- the gateway (ECS Express Gateway) */
+    /* --------------------------------------------------------------- the gateway (Lambda Web Function) */
     const gatewayLogs = new logs.LogGroup(this, "GatewayLogs", {
       retention: logs.RetentionDays.ONE_WEEK,
       removalPolicy: RemovalPolicy.DESTROY,
     });
 
-    const gatewayImage = new ecr_assets.DockerImageAsset(this, "GatewayImage", {
-      directory: ROOT,
-      file: "gateway/Dockerfile",
-      platform: Platform.LINUX_ARM64,
+    // NodejsFunction bundles the gateway source with esbuild and deploys it as a Lambda.
+    // The handler is already written to the APIGatewayProxyEventV2 contract (bootstrap.ts +
+    // entry.mjs), so no code changes are needed — only the infra changes.
+    const gatewayFn = new NodejsFunction(this, "GatewayFn", {
+      entry: path.join(ROOT, "gateway", "bootstrap.ts"),
+      handler: "handler",
+      runtime: lambda_.Runtime.NODEJS_24_X,
+      architecture: lambda_.Architecture.ARM_64,
+      memorySize: props.gatewayMemoryMiB ?? 512,
+      timeout: Duration.seconds(60),
+      logGroup: gatewayLogs,
+      vpc: vpc as ec2.IVpc,
+      vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS },
+      securityGroups: [gatewaySg],
+      bundling: {
+        format: OutputFormat.ESM,
+        // entry.mjs does a dynamic import of bootstrap.ts; tell esbuild the output is ESM
+        // and to bundle everything into one file so the dynamic import resolves at runtime.
+        mainFields: ["module", "main"],
+        esbuildArgs: { "--conditions": "module" },
+        externalModules: ["@aws-sdk/*"],
+        // The SAM build image for nodejs26.x does not exist yet; bundle locally instead.
+        // Node 26 + esbuild are already present in the dev environment.
+        forceDockerBundling: false,
+      },
+      environment: {
+        TABLE_NAME: state.tableName,
+        USAGE_STREAM: gatewayStream.ref,
+        DECIDER_URL: modelInternalUrl,
+        DECIDER_PATH: "/v1/systemone",
+        DECIDER_TIMEOUT_MS: "45000",
+        DECIDER_RETRIES: "2",
+        METRICS_NAMESPACE,
+        CACHE_TTL_SECONDS: "300",
+        APP_VERSION: String(this.node.tryGetContext("appVersion") ?? "unset"),
+        SERVE_CLIENT: "false",
+      },
     });
-
-    const taskExecutionRole = new iam.Role(this, "GatewayTaskExecutionRole", {
-      assumedBy: new iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName("service-role/AmazonECSTaskExecutionRolePolicy"),
-      ],
-    });
-
-    const taskRole = new iam.Role(this, "GatewayTaskRole", {
-      assumedBy: new iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
-    });
-    state.grantReadWriteData(taskRole);
-    taskRole.addToPolicy(
+    state.grantReadWriteData(gatewayFn);
+    gatewayFn.addToRolePolicy(
       new iam.PolicyStatement({ actions: ["firehose:PutRecord"], resources: [gatewayStream.attrArn] }),
     );
 
-    // Infrastructure role: Express Gateway uses this to manage the ALB, Fargate tasks,
-    // Auto Scaling, security groups, and log groups on your behalf.
-    const infrastructureRole = new iam.Role(this, "GatewayInfraRole", {
-      assumedBy: new iam.ServicePrincipal("ecs.amazonaws.com"),
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName("service-role/AmazonECSInfrastructureRoleforExpressGatewayServices"),
-      ],
-    });
-
-    const expressGateway = new ecs.CfnExpressGatewayService(this, "GatewayService", {
-      serviceName: "strands-decider-gateway",
-      cpu: String(props.gatewayCpu ?? 256),
-      memory: String(props.gatewayMemoryMiB ?? 512),
-      executionRoleArn: taskExecutionRole.roleArn,
-      taskRoleArn: taskRole.roleArn,
-      infrastructureRoleArn: infrastructureRole.roleArn,
-      healthCheckPath: "/healthz",
-      networkConfiguration: {
-        subnets: vpc.publicSubnets.map((s) => s.subnetId),
-      },
-      primaryContainer: {
-        image: gatewayImage.imageUri,
-        containerPort: 8080,
-        awsLogsConfiguration: {
-          logGroup: gatewayLogs.logGroupName,
-          logStreamPrefix: "gateway",
-        },
-        environment: [
-          { name: "PORT", value: "8080" },
-          { name: "TABLE_NAME", value: state.tableName },
-          { name: "USAGE_STREAM", value: gatewayStream.ref },
-          { name: "DECIDER_URL", value: modelInternalUrl },
-          { name: "DECIDER_PATH", value: "/v1/systemone" },
-          { name: "DECIDER_TIMEOUT_MS", value: "45000" },
-          { name: "DECIDER_RETRIES", value: "2" },
-          { name: "DECIDER_AUTH", value: "none" },
-          { name: "METRICS_NAMESPACE", value: METRICS_NAMESPACE },
-          { name: "CACHE_TTL_SECONDS", value: "300" },
-          { name: "APP_VERSION", value: String(this.node.tryGetContext("appVersion") ?? "unset") },
-        ],
-      },
-      scalingTarget: {
-        minTaskCount: 0,
-        maxTaskCount: props.gatewayMaxTasks ?? 10,
-        autoScalingMetric: "AVERAGE_CPU",
-        autoScalingTargetValue: 60,
+    const gatewayUrl = gatewayFn.addFunctionUrl({
+      authType: lambda_.FunctionUrlAuthType.NONE,
+      cors: {
+        allowedOrigins: ["*"],
+        allowedHeaders: ["content-type", "x-api-key", "x-request-id"],
+        allowedMethods: [lambda_.HttpMethod.POST, lambda_.HttpMethod.GET],
       },
     });
-    expressGateway.node.addDependency(infrastructureRole);
 
-    this.gatewayUrl = expressGateway.attrEndpoint;
+    this.gatewayUrl = gatewayUrl.url;
     this.tableName = state.tableName;
 
     /* ------------------------------------------------- the filing system and auditors */
@@ -329,8 +308,8 @@ export class StrandsDeciderStack extends Stack {
 
     /* ------------------------------------------------------------------ outputs */
     new CfnOutput(this, "GatewayUrl", {
-      value: expressGateway.attrEndpoint,
-      description: "ECS Express Gateway public endpoint.",
+      value: gatewayUrl.url,
+      description: "Lambda gateway public endpoint.",
     });
     new CfnOutput(this, "ModelUrl", {
       value: modelInternalUrl,
@@ -589,10 +568,10 @@ export class StrandsDeciderStack extends Stack {
 
     dashboard.addWidgets(
       new cw.GraphWidget({
-        title: "Gateway service (ECS Express Gateway): CPU/Memory",
+        title: "Gateway (Lambda): concurrent executions",
         left: [
-          new cw.Metric({ namespace: "AWS/ECS", metricName: "CPUUtilization", dimensionsMap: { ServiceName: "strands-decider-gateway" }, statistic: "Average" }),
-          new cw.Metric({ namespace: "AWS/ECS", metricName: "MemoryUtilization", dimensionsMap: { ServiceName: "strands-decider-gateway" }, statistic: "Average" }),
+          new cw.Metric({ namespace: "AWS/Lambda", metricName: "ConcurrentExecutions", dimensionsMap: { FunctionName: "strands-decider-gateway" }, statistic: "Maximum" }),
+          new cw.Metric({ namespace: "AWS/Lambda", metricName: "Throttles", dimensionsMap: { FunctionName: "strands-decider-gateway" }, statistic: "Sum" }),
         ],
         width: 12,
       }),

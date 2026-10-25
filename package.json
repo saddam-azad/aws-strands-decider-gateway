@@ -38,6 +38,7 @@
     "aws-cdk-lib": "^2.273.0",
     "aws4fetch": "^1.0.20",
     "constructs": "^10.8.1",
+    "esbuild": "^0.28.2",
     "typescript": "^7.0.2"
   }
 }

@@ -32,12 +32,19 @@ export function configFromEnv(env: NodeJS.ProcessEnv = process.env): GatewayConf
   };
 }
 
-let cached: Handler<APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2> | undefined;
+let _handler: ((event: APIGatewayProxyEventV2) => Promise<APIGatewayProxyStructuredResultV2>) | undefined;
 
 /** Build the handler once per execution environment. */
 export function createHandlerForLambda(): {
   handler: Handler<APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2>;
 } {
-  cached ??= createHandler({ config: configFromEnv() });
-  return { handler: cached };
+  _handler ??= createHandler({ config: configFromEnv() });
+  return { handler: _handler as Handler<APIGatewayProxyEventV2, APIGatewayProxyStructuredResultV2> };
 }
+
+// Top-level named export for NodejsFunction (esbuild entry point). Plain async — Node.js 24
+// removed callback-based handler support.
+export const handler = async (event: APIGatewayProxyEventV2): Promise<APIGatewayProxyStructuredResultV2> => {
+  _handler ??= createHandler({ config: configFromEnv() });
+  return _handler(event);
+};
