@@ -1,5 +1,5 @@
-// The Lambda entry point. It is `.mjs`, not `.ts`, on purpose: see README, "Why there is
-// no build step". Keep this file to a single dynamic import — anything more and type
-// stripping stops being the only transform involved in getting the handler running.
+// The local dev entry point. It is `.mjs` so Node can load it without type stripping.
+// Lambda does NOT use this file — the CDK stack points NodejsFunction at bootstrap.ts
+// directly, and esbuild bundles it. This shim is only used by scripts/dev-server.ts.
 const { handler } = (await import("./bootstrap.ts")).createHandlerForLambda();
 export { handler };

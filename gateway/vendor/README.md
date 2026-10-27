@@ -9,11 +9,8 @@ no bundler, so anything the handler imports at runtime has to be present in this
 - **Version:** 1.0.20
 - **License:** MIT — see `aws4fetch.LICENSE`
 
-Why it is here: the gateway SigV4-signs its calls to the decider Function URL
-(`AuthType: AWS_IAM`), which needs a signer inside the Lambda. `aws4fetch` is a single
-dependency-free file with published type declarations, so vendoring it costs ~11 KB and
-keeps the "no build step" property intact. The `aws4fetch` package stays a devDependency so
-`tests/unit/sigv4.test.ts` can assert our copy signs byte-identically to the published one.
-
-Do not edit these files by hand — replace them wholesale on upgrade and re-run the signature
-test.
+Why it is here: the gateway originally SigV4-signed its calls to the decider when it was
+exposed as a Lambda Function URL (`AuthType: AWS_IAM`). The model is now an internal ALB
+(no IAM auth on that hop), so `aws4fetch` is no longer used in the hot path. It remains
+vendored for any future IAM-authenticated upstream. `aws4fetch` stays a devDependency so
+`tests/unit/` can assert our copy signs byte-identically to the published one.

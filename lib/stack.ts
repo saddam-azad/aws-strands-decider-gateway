@@ -1,8 +1,8 @@
 /**
- * Strands Decider: model on Fargate (internal ALB), gateway on ECS Express Gateway.
- * CfnExpressGatewayService manages the public ALB, Fargate tasks, and scale-to-zero
- * for the gateway automatically. The model runs in a private Fargate service behind
- * an internal ALB reachable only from within the VPC.
+ * Strands Decider: model on Fargate (internal ALB), gateway on Lambda (Function URL).
+ * NodejsFunction bundles gateway/bootstrap.ts with esbuild and exposes it via a public
+ * Function URL. The model runs in a private Fargate service behind an internal ALB
+ * reachable only from within the VPC via the gateway's security group.
  */
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
@@ -247,9 +247,9 @@ export class StrandsDeciderStack extends Stack {
       removalPolicy: RemovalPolicy.DESTROY,
     });
 
-    // NodejsFunction bundles the gateway source with esbuild and deploys it as a Lambda.
-    // The handler is already written to the APIGatewayProxyEventV2 contract (bootstrap.ts +
-    // entry.mjs), so no code changes are needed — only the infra changes.
+    // NodejsFunction bundles gateway/bootstrap.ts with esbuild and deploys it as a Lambda.
+    // The handler export is a plain async function (Node.js 24 removed callback support).
+    // gateway/entry.mjs is the local dev shim and is not used here.
     const gatewayFn = new NodejsFunction(this, "GatewayFn", {
       entry: path.join(ROOT, "gateway", "bootstrap.ts"),
       handler: "handler",

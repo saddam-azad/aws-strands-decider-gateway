@@ -5,15 +5,15 @@ that gives calibrated answers to `noul` (yes/no), `choice` and `score` questions
 Fargate, behind a TypeScript gateway with multi-tenancy, confidence gating, and an evidence
 trail that reaches Athena.
 
-Two services. The gateway runs on ECS Express Gateway (public, scale-to-zero). The model runs
-on Fargate behind an internal ALB (private subnet, reachable only from within the VPC). Between
-them: a plain HTTP call over the VPC, and a Firehose → S3 → Glue → Athena pipeline that
-records every request that went through.
+Two services. The gateway runs on Lambda with a Function URL (public, scales to zero). The
+model runs on Fargate behind an internal ALB (private subnet, reachable only from within the
+VPC). Between them: a plain HTTP call over the VPC, and a Firehose → S3 → Glue → Athena
+pipeline that records every request that went through.
 
 ```
                  ┌──────────────────────────┐
-  browser ──┐    │  gateway (Node 26, arm64) │      plain HTTP      ┌────────────────────────┐
-  curl ─────┼───▶│  ECS Express Gateway      │────────────────────▶│ model (Fargate, x86_64)│
+  browser ──┐    │  gateway (Node 24, arm64) │      plain HTTP      ┌────────────────────────┐
+  curl ─────┼───▶│  Lambda Function URL      │────────────────────▶│ model (Fargate, x86_64)│
   client ───┘    │  x-api-key auth           │    internal ALB      │ 10 GB, FastAPI/uvicorn │
                  │  API keys → DynamoDB      │    private subnet    │ CPU-only torch + 2B    │
                  │  cache, quota, redaction  │                      │ cold start 25-60 s     │
@@ -51,35 +51,22 @@ bun run setup                   # seeds tenants, mints API keys, writes local co
 bun run e2e                     # exercises the deployed stack end to end
 ```
 
-## Why there is no build step
+## The build step
 
-`gateway/` is deployed to ECS **verbatim**. There is no bundler, no transpile, no `dist/`.
-The asset is the source, and `gateway/entry.mjs` is 4 lines.
+`gateway/bootstrap.ts` is the esbuild entry point. `NodejsFunction` in the CDK stack bundles
+it into a single ESM file and deploys it as a Lambda asset. There is no separate build script
+— bundling happens during `cdk deploy`.
 
-This works because Node 26 strips TypeScript types natively, and three things are kept true so
-it keeps working:
+The source still follows `erasableSyntaxOnly` (no `enum`, no `namespace`, no constructor
+parameter properties), which keeps the code compatible with Node's native type stripping for
+local development and tests, and lets esbuild treat it as plain ESM without a transform pass.
 
-1. **`erasableSyntaxOnly`** in `tsconfig.json`. Only type syntax is allowed — no `enum`, no
-   `namespace`, no parameter properties, nothing that needs a real transform. Node erases
-   types; it does not compile them.
-2. **Explicit `.ts` extensions** on every relative import (`allowImportingTsExtensions`).
-   Node's resolver does not guess; `./handler.ts` is a file, `./handler` is not.
-3. **`entry.mjs` stays a single dynamic import.** The one place a transform could sneak in is
-   the entry point itself, so it does one thing: `await import("./bootstrap.ts")`.
-
-The payoff is that a deployed container's stack trace points at `gateway/handler.ts:359`, the
-file you edited, with no source maps between you and it. The cost is that the gateway's
-dependencies must already exist in the Node 26 runtime. They do: the entire bare specifier set is
-
-```
-node:crypto  node:fs  node:path  node:timers/promises  node:url
-aws-lambda
-@aws-sdk/client-dynamodb  @aws-sdk/client-firehose  @aws-sdk/lib-dynamodb
-```
+`gateway/entry.mjs` still exists but is not the Lambda entry point. It is used by the local
+dev server (`scripts/dev-server.ts`), which runs the same handler without bundling.
 
 `aws4fetch` is vendored into `gateway/vendor/` — it is no longer used for signing the model
-call (the model is internal), but it remains available for any future IAM-authenticated
-upstream. See [`gateway/vendor/README.md`](gateway/vendor/README.md).
+call (the model is an internal ALB, no IAM auth needed on that hop), but it remains available
+for any future IAM-authenticated upstream. See [`gateway/vendor/README.md`](gateway/vendor/README.md).
 
 ## The model on Fargate
 
@@ -189,7 +176,7 @@ bun run dev          # fake model on :8080, real gateway on :3000
 ```
 
 `scripts/dev.sh` starts `model/devserver.py --fake` and then `scripts/dev-server.ts`, which
-runs **the same handler the ECS task runs**, wrapped in a `node:http` server that translates a
+runs **the same handler the Lambda runs**, wrapped in a `node:http` server that translates a
 request into an API Gateway v2 event. The translation is deliberate: a second, simplified
 request path for development is how "works locally, 502s in the cloud" happens.
 
@@ -271,7 +258,7 @@ right.
 ## Layout
 
 ```
-gateway/            the ECS Express Gateway asset, shipped verbatim
+gateway/            the Lambda gateway source (bundled by esbuild on deploy)
   handler.ts        the ten gates
   backends.ts       the decider HTTP client, retry ladder
   policy.ts         tenants, keys, quota, routing
@@ -335,8 +322,8 @@ Fargate task costs roughly $0.0009 per request in vCPU+memory seconds, plus the 
 Unlike Lambda, Fargate tasks with `minCapacity: 1` keep one task warm at all times — you pay
 for idle time but avoid cold starts on the first request of the day.
 
-The rest — the gateway on ECS Express Gateway, DynamoDB on-demand, Firehose, S3 with a 30-day
-lifecycle, Athena at a 1 GB cap — is noise beside it.
+The rest — the gateway on Lambda (scales to zero, no idle cost), DynamoDB on-demand, Firehose,
+S3 with a 30-day lifecycle, Athena at a 1 GB cap — is noise beside it.
 
 `cdk destroy` removes everything except the two S3 buckets' contents if you keep them; the
 buckets themselves are set to destroy with the stack.

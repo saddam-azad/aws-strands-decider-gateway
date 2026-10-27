@@ -10,7 +10,7 @@
  *   5. Redact                         — before hashing for the cache and before the wire.
  *   6. Cache (L0 in-process, L1 DynamoDB).
  *   7. Quota                          — reserve a slot for this UTC hour, atomically.
- *   8. Model                          — SigV4 to the decider Function URL.
+ *   8. Model                          — plain HTTP to the internal ALB, with a retry ladder.
  *   9. Gate + format                  — local confidence metrics, act/review/escalate.
  *  10. Evidence                       — EMF metrics, a usage record, a structured log line.
  *
